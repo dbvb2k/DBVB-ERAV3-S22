@@ -64,27 +64,18 @@ def setup_logging(output_dir: str):
 # Initialize logger
 logger = setup_logging("logs")
 
-def setup_model_and_tokenizer(model_name: str = "facebook/opt-350m"):
-    """Setup the model and tokenizer with qLoRA configuration."""
+def setup_model_and_tokenizer(model_name: str = "microsoft/phi-2"):
+    """Setup the model and tokenizer with quantization configuration."""
     logger.info("\n" + "="*NUM_DASHES)
     logger.info(f"Setting up model and tokenizer for {model_name}")
     logger.info("-"*NUM_DASHES)
     
-    # Configure 4-bit quantization
-    logger.info("Configuring 4-bit quantization...")
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-    )
-
     # Load tokenizer first
     logger.info("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=True,
-        padding_side="right",
+        padding_side="right"
     )
     
     # Log initial tokenizer state
@@ -99,26 +90,45 @@ def setup_model_and_tokenizer(model_name: str = "facebook/opt-350m"):
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    # Verify padding token configuration
-    logger.info("Verifying padding token configuration...")
-    if tokenizer.pad_token is None or tokenizer.pad_token_id is None:
-        logger.error("Failed to set padding token!")
-        raise ValueError("Padding token configuration failed")
-    
-    logger.info("Final tokenizer state:")
-    logger.info(f"Padding token: {tokenizer.pad_token}")
-    logger.info(f"Padding token ID: {tokenizer.pad_token_id}")
-    
-    # Load model with padding token configuration
-    logger.info("Loading model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-        use_cache=False,
-        pad_token_id=tokenizer.pad_token_id,
-    )
+    try:
+        # Try loading with 4-bit quantization first
+        logger.info("Attempting to load model with 4-bit quantization...")
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+            use_cache=False,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    except RuntimeError as e:
+        logger.warning("4-bit quantization failed, attempting 8-bit quantization...")
+        try:
+            # Try 8-bit quantization
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                load_in_8bit=True,
+                device_map="auto",
+                trust_remote_code=True,
+                use_cache=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        except RuntimeError:
+            logger.warning("8-bit quantization failed, falling back to CPU (no quantization)...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="cpu",
+                trust_remote_code=True,
+                use_cache=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
     
     # Ensure model config has the correct padding token ID
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -133,22 +143,24 @@ def setup_model_and_tokenizer(model_name: str = "facebook/opt-350m"):
     logger.info("Final model state:")
     logger.info(f"Model padding token: {model.config.pad_token}")
     logger.info(f"Model padding token ID: {model.config.pad_token_id}")
+    logger.info(f"Model device: {next(model.parameters()).device}")
     
-    # Prepare model for k-bit training
-    logger.info("Preparing model for k-bit training...")
-    model = prepare_model_for_kbit_training(model)
-
+    # Prepare model for training
+    logger.info("Preparing model for training...")
+    if hasattr(model, "is_loaded_in_4bit") and model.is_loaded_in_4bit:
+        model = prepare_model_for_kbit_training(model)
+    
     # Configure LoRA
     logger.info("Configuring LoRA parameters...")
     lora_config = LoraConfig(
         r=16,
         lora_alpha=32,
-        target_modules=["q_proj", "v_proj"],  # OPT-specific attention modules
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # Phi-2 specific attention modules
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM"
     )
-
+    
     # Get PEFT model
     logger.info("Applying LoRA configuration...")
     model = get_peft_model(model, lora_config)
@@ -455,30 +467,30 @@ def create_training_args(output_dir: str):
     config = GRPOConfig(
         output_dir=output_dir,
         run_name=f"grpo-training-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-        num_train_epochs=3,  # Increased to 3 epochs
+        num_train_epochs=3,
         per_device_train_batch_size=per_device_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=2e-5,  # Further reduced for more stable learning
+        learning_rate=2e-5,
         fp16=True,
         logging_steps=10,
         save_strategy="steps",
-        save_steps=100,
+        save_steps=200,
         eval_strategy="steps",
         eval_steps=50,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        report_to="tensorboard",
+        report_to="none",  # Remove wandb reporting
         max_prompt_length=256,
         label_names=["input_ids", "attention_mask", "labels"],
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         num_generations=num_generations,
-        max_steps=2000,  # Increased to 2000 steps for more training
-        warmup_ratio=0.1,  # Use ratio instead of steps
+        max_steps=1000,
+        warmup_ratio=0.1,
         weight_decay=0.01,
-        lr_scheduler_type="cosine",  # Use cosine scheduler for better convergence
-        optim="paged_adamw_32bit",  # Use paged AdamW for memory efficiency
+        lr_scheduler_type="cosine",
+        optim="paged_adamw_32bit",
     )
     
     logger.info("Training Configuration:")
@@ -509,19 +521,20 @@ def generate_response(model, tokenizer, prompt: str) -> str:
     # Enhanced generation parameters for more accurate responses
     outputs = model.generate(
         **inputs,
-        max_new_tokens=100,  # Control by tokens rather than total length
+        max_new_tokens=100,
         num_return_sequences=1,
-        temperature=0.4,  # Further reduced temperature for even more focused responses
+        num_beams=2,  # Set to 2 to enable beam search
+        temperature=0.4,
         do_sample=True,
         pad_token_id=tokenizer.pad_token_id,
         use_cache=False,
-        min_new_tokens=30,  # Ensure minimal response length
+        min_new_tokens=30,
         no_repeat_ngram_size=3,
-        top_p=0.80,  # More focused sampling
-        top_k=40,  # Limit vocabulary further
-        repetition_penalty=1.5,  # Stronger repetition penalty
-        length_penalty=1.0,  # Encourage slightly longer responses
-        early_stopping=True,  # Stop when model would naturally end
+        top_p=0.80,
+        top_k=40,
+        repetition_penalty=1.5,
+        length_penalty=1.0,
+        early_stopping=True,  # Now valid since num_beams > 1
     )
     
     # Get the generated text
@@ -546,7 +559,7 @@ def generate_response(model, tokenizer, prompt: str) -> str:
             
         # Trim to one sentence if it's too long
         first_sentence_end = next((i for i, char in enumerate(response) if char in ['.', '!', '?']), len(response))
-        if first_sentence_end < len(response) - 1 and first_sentence_end > 40:  # Only trim if first sentence is reasonably long
+        if first_sentence_end < len(response) - 1 and first_sentence_end > 40:
             response = response[:first_sentence_end + 1]
     
     # If response is empty, return a context-specific default response
@@ -567,7 +580,7 @@ def generate_response(model, tokenizer, prompt: str) -> str:
     return response
 
 def train_model(
-    model_name: str = "facebook/opt-350m",
+    model_name: str = "microsoft/phi-2",
     output_dir: str = None,
     num_prompts: int = 5
 ):
@@ -737,7 +750,7 @@ if __name__ == "__main__":
         output_dir = os.path.join(base_dir, f"grpo_model_{timestamp}")
         
         results = train_model(
-            model_name="facebook/opt-350m",  # Use OPT-350M instead of DistilGPT-2
+            model_name="microsoft/phi-2",  # Use Phi-2 instead of OPT-350M
             output_dir=output_dir,
             num_prompts=5
         )
